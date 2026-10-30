@@ -1,0 +1,193 @@
+{
+  "tipo": "basico",
+  "titulo": "Relatório de Auditoria de Segurança — TaskFlow",
+  "cabecalho": "Auditoria de Segurança — TaskFlow (EXEMPLO FICTÍCIO)",
+  "projeto": "TaskFlow",
+  "data": "30/10/2026",
+  "stack": "Next.js 14 (App Router) · TypeScript · Supabase (Postgres + Auth + Storage) · Stripe · Docker Compose · GitHub Actions",
+  "escopo": "Repositório completo: app/ (34 rotas de API, 21 páginas), components/, lib/, supabase/migrations/ (18 migrations), docker-compose.yml, .github/workflows/ e histórico Git (412 commits).",
+  "metodologia": [
+    ["Banco sem tranca", "Mecanismo de isolamento detectado: RLS do Supabase. Verificadas as 18 migrations: tabelas com RLS desabilitado e policies permissivas."],
+    ["Permissão no navegador", "Cruzados os 7 gates de papel do frontend (isAdmin, canManage) com os handlers de app/api/ correspondentes."],
+    ["IDOR", "Percorridos os 34 handlers de rota. Atenção especial aos que usam o client service_role, que ignora RLS."],
+    ["Chaves expostas", "Busca em código, .env*, docker-compose, workflows, bundle de produção (.next/static) e histórico Git."],
+    ["XSS", "Busca por dangerouslySetInnerHTML, renderização de Markdown, href dinâmicos e templates de e-mail."]
+  ],
+  "aviso": "Este é um RELATÓRIO DE EXEMPLO. O projeto TaskFlow, os arquivos, as linhas e os achados são fictícios e servem apenas para mostrar o formato do resultado.",
+  "categorias": ["Banco sem tranca", "Permissão no navegador", "IDOR", "Chaves expostas", "XSS"],
+  "achados": [
+    {
+      "id": "B-01", "categoria": "Banco sem tranca", "severidade": "CRÍTICA",
+      "arquivo": "supabase/migrations/20250310_invoices.sql:1-14",
+      "titulo": "Tabela invoices criada sem RLS",
+      "descricao": "A tabela invoices não tem ENABLE ROW LEVEL SECURITY. Com a anon key (pública no frontend), qualquer pessoa lê e altera faturas de todas as organizações via API REST do Supabase.",
+      "trecho": "create table public.invoices (\n  id uuid primary key default gen_random_uuid(),\n  org_id uuid references orgs(id),\n  amount_cents int not null,\n  ...\n);\n-- nenhum 'alter table ... enable row level security'",
+      "impacto": "Vazamento e adulteração de dados financeiros de todos os clientes.",
+      "correcao": "Habilitar RLS em invoices e criar policies de SELECT/INSERT/UPDATE/DELETE que exijam org_id pertencente ao usuário (via tabela members)."
+    },
+    {
+      "id": "B-02", "categoria": "Banco sem tranca", "severidade": "ALTA",
+      "arquivo": "supabase/migrations/20250402_tasks_policies.sql:8-10",
+      "titulo": "Policy de leitura de tasks com USING (true)",
+      "descricao": "RLS está habilitado em tasks, mas a policy de SELECT libera todas as linhas para qualquer usuário autenticado, de qualquer organização.",
+      "trecho": "create policy \"tasks_select\" on public.tasks\n  for select to authenticated\n  using (true);",
+      "impacto": "Qualquer conta gratuita lê as tarefas de todas as empresas clientes.",
+      "correcao": "Trocar por using (org_id in (select org_id from members where user_id = auth.uid()))."
+    },
+    {
+      "id": "B-03", "categoria": "Permissão no navegador", "severidade": "ALTA",
+      "arquivo": "app/api/admin/users/[id]/route.ts:8-20",
+      "titulo": "DELETE de usuário só é bloqueado na tela",
+      "descricao": "O botão 'Remover usuário' só aparece se isAdmin (components/UserTable.tsx:41), mas o handler DELETE só verifica se há sessão, não o papel.",
+      "trecho": "export async function DELETE(req, { params }) {\n  const user = await getSessionUser();\n  if (!user) return new Response(null, { status: 401 });\n  await supabaseAdmin.from('users').delete().eq('id', params.id);",
+      "impacto": "Qualquer usuário logado remove qualquer outro usuário, inclusive administradores.",
+      "correcao": "Verificar no servidor user.role === 'admin' e se o alvo pertence à mesma organização antes do delete."
+    },
+    {
+      "id": "B-04", "categoria": "IDOR", "severidade": "CRÍTICA",
+      "arquivo": "app/api/projects/[id]/export/route.ts:12-25",
+      "titulo": "Exportação de projeto sem verificação de dono",
+      "descricao": "O export usa o client service_role (ignora RLS) e busca o projeto apenas pelo id da URL, sem conferir se o chamador é membro da organização.",
+      "trecho": "const { data } = await supabaseAdmin\n  .from('projects')\n  .select('*, tasks(*), files(*)')\n  .eq('id', params.id)\n  .single();",
+      "impacto": "Trocando o id na URL, um usuário baixa projetos completos (tarefas e arquivos) de outras empresas.",
+      "correcao": "Usar o client do usuário (respeita RLS) ou adicionar .eq('org_id', membership.org_id) e validar a membership antes."
+    },
+    {
+      "id": "B-05", "categoria": "Chaves expostas", "severidade": "CRÍTICA",
+      "arquivo": "lib/supabase/admin.ts:3",
+      "titulo": "Service role key exposta ao navegador",
+      "descricao": "A chave service_role é lida de NEXT_PUBLIC_SUPABASE_SERVICE_KEY. Variáveis NEXT_PUBLIC_ vão para o bundle do cliente; a chave foi encontrada em .next/static/chunks/app-3f9a.js.",
+      "trecho": "export const supabaseAdmin = createClient(\n  process.env.NEXT_PUBLIC_SUPABASE_URL!,\n  process.env.NEXT_PUBLIC_SUPABASE_SERVICE_KEY! // eyJh****\n);",
+      "impacto": "Acesso total ao banco, ignorando RLS, para qualquer visitante do site.",
+      "correcao": "Rotacionar a chave no painel do Supabase, renomear para SUPABASE_SERVICE_ROLE_KEY (sem NEXT_PUBLIC_) e usar só em código de servidor (import 'server-only')."
+    },
+    {
+      "id": "B-06", "categoria": "Chaves expostas", "severidade": "ALTA",
+      "arquivo": ".env.production (commit a91c2e4, removido em 7d03b11)",
+      "titulo": "Chave secreta do Stripe no histórico Git",
+      "descricao": "O arquivo .env.production foi commitado com STRIPE_SECRET_KEY=sk_l**** e removido depois, mas continua acessível no histórico.",
+      "trecho": "STRIPE_SECRET_KEY=sk_l****\nSTRIPE_WEBHOOK_SECRET=whse****",
+      "impacto": "Quem tiver acesso ao repositório pode criar cobranças, reembolsos e ler dados de clientes no Stripe.",
+      "correcao": "Revogar e gerar novas chaves no Stripe. Opcional: limpar o histórico com git filter-repo."
+    },
+    {
+      "id": "B-07", "categoria": "Chaves expostas", "severidade": "MÉDIA",
+      "arquivo": "docker-compose.yml:22",
+      "titulo": "JWT_SECRET com default público",
+      "descricao": "Se JWT_SECRET não for definido no deploy, o valor 'changeme' é usado, e não há validação no startup que impeça isso.",
+      "trecho": "environment:\n  - JWT_SECRET=${JWT_SECRET:-changeme}",
+      "impacto": "Em deploys sem a variável, um atacante forja tokens de sessão válidos.",
+      "correcao": "Remover o default e falhar no startup se JWT_SECRET estiver vazio ou com menos de 32 caracteres."
+    },
+    {
+      "id": "B-08", "categoria": "XSS", "severidade": "ALTA",
+      "arquivo": "components/TaskComment.tsx:22",
+      "titulo": "Comentários em Markdown renderizados sem sanitização",
+      "descricao": "O comentário do usuário é convertido com marked() e injetado com dangerouslySetInnerHTML. Não há DOMPurify nem similar no projeto.",
+      "trecho": "<div\n  className=\"prose\"\n  dangerouslySetInnerHTML={{ __html: marked(comment.body) }}\n/>",
+      "impacto": "XSS armazenado: um comentário com <img onerror=...> executa script na sessão de quem abrir a tarefa.",
+      "correcao": "Sanitizar com DOMPurify.sanitize(marked(body)) ou usar react-markdown sem rehype-raw."
+    },
+    {
+      "id": "B-09", "categoria": "XSS", "severidade": "BAIXA",
+      "arquivo": "lib/email/invite.ts:14",
+      "titulo": "Nome do convidante sem escape no e-mail de convite",
+      "descricao": "inviterName é interpolado direto no HTML do e-mail. A maioria dos clientes de e-mail bloqueia scripts, mas permite injeção de links e HTML enganoso.",
+      "trecho": "html: `<p>${inviterName} convidou você para o TaskFlow</p>`",
+      "impacto": "Phishing usando o domínio legítimo do TaskFlow.",
+      "correcao": "Escapar o valor (ex: escape-html) ou usar um template com escape automático (React Email)."
+    }
+  ],
+  "pontos_fortes": [
+    ["RLS correto em projects e members", "supabase/migrations/20250301_core.sql:40-71: policies filtram por org_id via members em SELECT/INSERT/UPDATE/DELETE."],
+    ["PATCH e DELETE de tarefas validam dono", "app/api/tasks/[id]/route.ts:15 e :48 usam o client do usuário, que respeita RLS."],
+    ["Rotas de planos exigem admin no servidor", "app/api/admin/plans/route.ts:9 verifica role === 'admin' antes de qualquer operação."],
+    ["Nenhum segredo no código-fonte atual", "Varredura em app/, lib/ e components/ sem chaves fixas; .env* está no .gitignore desde o commit 7d03b11."],
+    ["Escape padrão do React no restante da UI", "Os outros 40 componentes que exibem dados de usuário usam JSX ({valor}), que escapa HTML."]
+  ],
+  "pontos_fracos": [
+    "Uso do client service_role em rotas de usuário (B-03, B-04): a proteção do RLS fica desligada exatamente onde mais importa.",
+    "Segredos com caminho para o navegador ou para o histórico Git (B-05, B-06).",
+    "RLS inconsistente: tabelas antigas corretas, tabelas novas sem policy ou com USING (true) (B-01, B-02)."
+  ],
+  "recomendacoes": [
+    ["P1", "Rotacionar a service role key do Supabase e as chaves do Stripe; mover para variáveis sem NEXT_PUBLIC_ (B-05, B-06)."],
+    ["P1", "Habilitar RLS em invoices e corrigir a policy de tasks (B-01, B-02)."],
+    ["P1", "Adicionar verificação de membership no export de projetos (B-04)."],
+    ["P2", "Validar papel admin no servidor em todas as rotas de app/api/admin/ (B-03)."],
+    ["P2", "Sanitizar Markdown dos comentários com DOMPurify (B-08)."],
+    ["P3", "Remover default de JWT_SECRET e validar no startup; escapar HTML nos e-mails (B-07, B-09)."]
+  ],
+  "issues": [
+    {
+      "titulo": "[Segurança] Tabelas invoices e tasks acessíveis por outras organizações (RLS)",
+      "labels": "security, crítica",
+      "achados": ["B-01", "B-02"],
+      "descricao": "A tabela invoices não tem RLS habilitado e a policy de leitura de tasks usa USING (true). Com a anon key, que é pública, qualquer pessoa consegue ler dados de todas as organizações.",
+      "evidencia": "supabase/migrations/20250310_invoices.sql:1-14\nsupabase/migrations/20250402_tasks_policies.sql:8-10",
+      "impacto": "Vazamento de faturas e tarefas de todos os clientes.",
+      "correcao": "Criar migration que habilite RLS em invoices e reescreva as policies filtrando por org_id via members.",
+      "aceite": ["RLS habilitado em invoices com policies para as 4 operações", "Policy tasks_select filtra por org_id", "Teste: usuário da org A não lê dados da org B"]
+    },
+    {
+      "titulo": "[Segurança] Service role key do Supabase exposta no bundle do frontend",
+      "labels": "security, crítica",
+      "achados": ["B-05"],
+      "descricao": "A chave service_role é lida de uma variável NEXT_PUBLIC_ e acaba no JavaScript entregue ao navegador.",
+      "evidencia": "lib/supabase/admin.ts:3\n.next/static/chunks/app-3f9a.js",
+      "impacto": "Acesso irrestrito ao banco para qualquer visitante.",
+      "correcao": "Rotacionar a chave, renomear para SUPABASE_SERVICE_ROLE_KEY e importar 'server-only' em lib/supabase/admin.ts.",
+      "aceite": ["Chave antiga revogada", "Nenhuma ocorrência de service key em .next/static após o build", "Build falha se admin.ts for importado no cliente"]
+    },
+    {
+      "titulo": "[Segurança] Exportação de projeto permite baixar dados de outras empresas (IDOR)",
+      "labels": "security, crítica",
+      "achados": ["B-04"],
+      "descricao": "GET /api/projects/[id]/export busca o projeto apenas pelo id, usando o client que ignora RLS.",
+      "evidencia": "app/api/projects/[id]/export/route.ts:12-25",
+      "impacto": "Exfiltração de projetos completos trocando o id na URL.",
+      "correcao": "Validar a membership do usuário na org do projeto antes da consulta, ou usar o client do usuário.",
+      "aceite": ["Retorna 404 para projeto de outra org", "Teste de regressão cobrindo o caso", "Demais rotas /api/projects/[id]/* revisadas"]
+    },
+    {
+      "titulo": "[Segurança] Chaves do Stripe commitadas no histórico Git",
+      "labels": "security, alta",
+      "achados": ["B-06"],
+      "descricao": "O .env.production com STRIPE_SECRET_KEY foi commitado em a91c2e4 e continua no histórico.",
+      "evidencia": ".env.production (commit a91c2e4)",
+      "impacto": "Operações financeiras em nome da empresa.",
+      "correcao": "Revogar as chaves no painel do Stripe e gerar novas.",
+      "aceite": ["Chaves antigas revogadas no Stripe", "Novas chaves apenas no provedor de deploy"]
+    },
+    {
+      "titulo": "[Segurança] Rota de remoção de usuários sem verificação de admin no servidor",
+      "labels": "security, alta",
+      "achados": ["B-03"],
+      "descricao": "A UI esconde o botão para não admins, mas o DELETE /api/admin/users/[id] só exige estar logado.",
+      "evidencia": "app/api/admin/users/[id]/route.ts:8-20",
+      "impacto": "Qualquer usuário remove qualquer conta.",
+      "correcao": "Criar helper requireAdmin() e aplicá-lo em todas as rotas de app/api/admin/.",
+      "aceite": ["Usuário comum recebe 403", "Todas as rotas de app/api/admin/ usam requireAdmin()"]
+    },
+    {
+      "titulo": "[Segurança] XSS armazenado nos comentários de tarefas",
+      "labels": "security, alta",
+      "achados": ["B-08"],
+      "descricao": "Markdown dos comentários é convertido em HTML e injetado sem sanitização.",
+      "evidencia": "components/TaskComment.tsx:22",
+      "impacto": "Execução de script na sessão de outros usuários.",
+      "correcao": "Aplicar DOMPurify.sanitize no HTML gerado.",
+      "aceite": ["Payload <img src=x onerror=alert(1)> não executa", "Teste de componente cobrindo o caso"]
+    },
+    {
+      "titulo": "[Segurança] Endurecimento: default de JWT_SECRET e HTML sem escape em e-mails",
+      "labels": "security, média",
+      "achados": ["B-07", "B-09"],
+      "descricao": "JWT_SECRET usa 'changeme' como fallback e o e-mail de convite interpola o nome sem escape.",
+      "evidencia": "docker-compose.yml:22\nlib/email/invite.ts:14",
+      "impacto": "Tokens forjáveis em deploys mal configurados; phishing pelo e-mail de convite.",
+      "correcao": "Remover o fallback e validar no startup; escapar HTML no template.",
+      "aceite": ["App não sobe sem JWT_SECRET forte", "inviterName escapado no e-mail"]
+    }
+  ]
+}
